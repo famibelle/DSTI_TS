@@ -1,0 +1,87 @@
+---
+title: "Lecture de Elec-train.xlsx"
+author: ""
+date: "2026-09-27"
+output: html_document
+---
+
+
+## 1. Chargement des packages
+
+Le package `readxl` est nécessaire pour lire le fichier Excel.
+Si le package manque, installer avec : `install.packages("readxl")`.
+
+```{r packages, message = FALSE}
+library(readxl)
+```
+
+## 2. Lecture du fichier Excel
+
+```{r lecture, cache=FALSE}
+chemin_fichier <- "Elec-train.xlsx"
+
+# Lister les feuilles du classeur
+elec_train <- read_excel(chemin_fichier)
+elec_train
+```
+
+## 3. Dimensions des données
+
+```{r dimensions}
+cat("Lignes :", nrow(elec_train), "\n")
+cat("Colonnes :", ncol(elec_train), "\n")
+```
+
+## 4. Types des colonnes
+
+```{r structure}
+str(elec_train)
+```
+
+## 5. Statistiques descriptives
+
+```{r summary}
+summary(elec_train)
+```
+```{r}
+ggseasonplot(varicelle,polar=TRUE)
+ggseasonplot(varicelle,year.labels=TRUE,week.labels.left=TRUE)
+```
+
+arima(Elec_train[,"Power (kW)"])
+
+
+## 6. ACF et PACF de la variable Power (kw)
+
+On extrait la colonne `Power (kw)` (recherche insensible à la casse et aux espaces).
+Les graphiques ACF et PACF sont calculés avec le package `stats` (`acf()`, `pacf()`).
+
+```{r acf_pacf}
+library(stats)
+
+# Localiser la colonne Power (kw)
+nom_colonne <- grep("power", colnames(elec_train), ignore.case = TRUE)[1]
+if (is.na(nom_colonne)) {
+  stop("Colonne 'Power (kw)' introuvable. Colonnes disponibles : ",
+       paste(colnames(elec_train), collapse = ", "))
+}
+
+power <- as.numeric(elec_train[[nom_colonne]])
+cat("Colonne utilisée :", colnames(elec_train)[nom_colonne], "\n")
+
+# Nombre de lags : règle empirique ~ sqrt(n)
+nb_lags <- max(10, floor(sqrt(length(power))))
+
+# ACF
+acf(power, main = "ACF - Power (kw)", ylab = "Corrélation",
+    lag.max = nb_lags)
+
+# PACF
+pacf(power, main = "PACF - Power (kw)", ylab = "Corrélation partielle",
+     lag.max = nb_lags)
+```
+
+**Interprétation rapide :**
+- **ACF** décroissant lentement de façon exponentielle → série non stationnaire (tendance) ; vérifier les ACF aux lags saisonniers (p. ex. 24 pour des données horaires).
+- **PACF** coupant à un lag \(p\) → autorégression d'ordre \(p\) (composante AR).
+- **ACF** coupant à un lag \(q\) → moyenne mobile d'ordre \(q\) (composante MA).
