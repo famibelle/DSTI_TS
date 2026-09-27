@@ -1,0 +1,261 @@
+---
+title: "Part 2 - WNN (Weighted Nearest Neighbours) Forecasting"
+author: ""
+date: "2026-09-27"
+output: html_document
+---
+
+## 1. Contexte et référence
+
+On implémente ici la méthode **WNN (Weighted Nearest Neighbours)** décrite en Section 3.1 de :
+
+> Talavera-Llames, R.L., Pérez-Chacón, R., Martínez-Ballesteros, M., Troncoso, A., Martínez-Álvarez, F.
+> (2016). *A Nearest Neighbours-Based Algorithm for Big Time Series Data Forecasting*. In: Hybrid
+> Artificial Intelligent Systems, HAIS 2016, LNCS vol. 9648, Springer.
+> [https://doi.org/10.1007/978-3-319-32034-2_15](https://doi.org/10.1007/978-3-319-32034-2_15)
+
+WNN est la méthode de référence (« well-known weighted nearest neighbor method ») que les auteurs et
+leurs travaux ultérieurs (EWNN, MV-kWNN) prennent comme point de départ pour la prévision de séries
+temporelles de type consommation électrique. Le principe :
+
+1. **Construction des instances d'entraînement** : à partir de la série passée, on découpe une fenêtre
+   glissante. Chaque instance est décrite par un vecteur de features (les `lags` valeurs passées) et une
+   cible (la ou les valeur(s) suivante(s) à prévoir).
+2. **Instance requête** : la dernière fenêtre connue de la série (features connues, cible à prévoir).
+3. **Distance** : distance euclidienne entre l'instance requête et chaque instance d'entraînement.
+4. **k plus proches voisins** : on retient les `k` instances d'entraînement les plus proches.
+5. **Combinaison pondérée (le "W" de WNN)** : chaque voisin `i` reçoit un poids `w_i = 1 / d_i`
+   (réciproque de sa distance à la requête), et la prévision est la moyenne pondérée des cibles des
+   voisins : `pred = (Σ w_i * t_i) / (Σ w_i)`. Si un voisin est à distance nulle, sa cible est utilisée
+   directement (cas particulier évitant la division par zéro).
+6. **Horizon multi-pas** : deux stratégies possibles — **MIMO** (Multiple Input Multiple Output : la
+   cible d'une instance est directement un vecteur de `h` valeurs futures, prédites en un seul appel) ou
+   **récursive** (un modèle à un pas est appliqué itérativement, les prévisions précédentes servant de
+   pseudo-observations pour construire la fenêtre suivante).
+
+**Note méthodologique** : la présentation "grand public" de cette famille de méthodes (par ex. l'article
+R Journal décrivant le package `tsfknn`, écrit par la même équipe) énonce parfois le poids comme
+`w_i = 1/d_i²`. En inspectant le code source de référence (`tsfknn`, développé par les mêmes auteurs), le
+poids réellement utilisé est `w_i = 1/d_i` (réciproque simple de la distance, pas son carré) — c'est cette
+version, vérifiée empiriquement ci-dessous, qui est implémentée ici.
+
+## 2. Chargement et préparation des données
+
+On reprend le même pipeline que dans `Elec_train.Rmd` (voir ce fichier pour le détail des choix :
+parsing du Timestamp au format mixte, correction du trou de données du 18/02).
+
+```{r packages, message = FALSE}
+library(readxl)
+library(forecast)
+library(ggplot2)
+```
+
+```{r data}
+elec_train <- read_excel("Elec-train.xlsx")
+
+parse_ts <- function(x) {
+  is_serial <- grepl("^[0-9.]+$", x)
+  out <- as.POSIXct(rep(NA_real_, length(x)), origin = "1970-01-01", tz = "UTC")
+  out[is_serial]  <- as.POSIXct(as.numeric(x[is_serial]) * 86400, origin = "1899-12-30", tz = "UTC")
+  out[!is_serial] <- as.POSIXct(x[!is_serial], format = "%m/%d/%Y %H:%M", tz = "UTC")
+  out
+}
+elec_train$Timestamp <- parse_ts(elec_train$Timestamp)
+
+n_train <- sum(!is.na(elec_train$`Power (kW)`))
+power_train <- ts(elec_train$`Power (kW)`[1:n_train], frequency = 96)
+power_train[power_train < 1] <- NA          # trou de capteur du 18/02 (11 points a 0)
+power_train_clean <- na.interp(power_train)
+
+h <- 96   # 24h en pas de 15 min : horizon a prevoir (19/02/2010)
+```
+
+## 3. Implémentation de l'algorithme WNN
+
+```{r wnn_implementation}
+wnn_forecast <- function(x, lags, h = 1, k = 3,
+                          msas = c("MIMO", "recursive"),
+                          cb   = c("weighted", "mean")) {
+  msas <- match.arg(msas)
+  cb   <- match.arg(cb)
+  x    <- as.numeric(x)
+  n    <- length(x)
+  lags <- sort(lags)
+  max_lag <- max(lags)
+
+  # Vecteur de features au temps t : les valeurs passees aux lags demandes
+  build_feature <- function(series, t) series[t - lags + 1]
+
+  # Distance euclidienne (Eq. 1 du papier / de la Section 3.1)
+  euclidean <- function(a, b) sqrt(sum((a - b)^2))
+
+  # Combinaison des cibles des k plus proches voisins (Eq. 2 = mean, Eq. 3 = weighted)
+  combine <- function(nb_targets, nb_dists) {
+    if (any(nb_dists == 0)) {
+      # cas particulier : distance nulle -> on prend directement la cible de ce voisin
+      return(unname(nb_targets[which(nb_dists == 0)[1], ]))
+    }
+    if (cb == "mean") return(unname(colMeans(nb_targets)))
+    w <- 1 / nb_dists                                   # w_i = 1 / d_i
+    as.numeric((w %*% nb_targets) / sum(w))             # somme ponderee normalisee
+  }
+
+  # ---- Construction des instances d'entrainement (features, cibles) ----
+  target_len <- if (msas == "MIMO") h else 1
+  t_min <- max_lag
+  t_max <- n - target_len
+  if (t_min > t_max) stop("Serie trop courte pour ces lags/horizon")
+
+  train_idx      <- t_min:t_max
+  train_features <- do.call(rbind, lapply(train_idx, build_feature, series = x))
+  train_targets  <- do.call(rbind, lapply(train_idx, function(t) x[(t + 1):(t + target_len)]))
+
+  # Prevision a un pas (ou vecteur MIMO) a partir d une serie (etendue ou non)
+  predict_one_step <- function(series_ext) {
+    q  <- build_feature(series_ext, length(series_ext))
+    d  <- apply(train_features, 1, euclidean, b = q)
+    nn <- order(d)[seq_len(k)]
+    combine(train_targets[nn, , drop = FALSE], d[nn])
+  }
+
+  if (msas == "MIMO") {
+    fc <- predict_one_step(x)
+  } else {
+    # strategie recursive : le modele ne predit qu un pas, on reinjecte la prevision
+    fc <- numeric(h)
+    series_ext <- x
+    for (step in seq_len(h)) {
+      pred <- predict_one_step(series_ext)
+      fc[step]   <- pred
+      series_ext <- c(series_ext, pred)
+    }
+  }
+  fc
+}
+```
+
+## 4. Validation de l'implémentation
+
+Avant d'appliquer WNN à `Elec-train`, on vérifie que l'implémentation ci-dessus reproduit exactement les
+résultats du package de référence `tsfknn` (développé par la même équipe de recherche), sur des séries
+classiques et plusieurs configurations (MIMO/récursif, pondéré/moyenne, lags non contigus).
+
+```{r validation, message = FALSE}
+library(tsfknn)
+
+check <- function(label, ref, mine) {
+  cat(label, "- ecart max avec tsfknn:", max(abs(ref - mine)), "\n")
+}
+
+ts_data <- window(UKDriverDeaths, end = c(1979, 12))
+
+ref1  <- knn_forecasting(ts_data, h = 12, lags = 1:12, k = 2, msas = "MIMO", cf = "weighted", transform = "none")
+mine1 <- wnn_forecast(ts_data, lags = 1:12, h = 12, k = 2, msas = "MIMO", cb = "weighted")
+check("MIMO + weighted", as.numeric(ref1$prediction), mine1)
+
+ref2  <- knn_forecasting(USAccDeaths, h = 4, lags = 1:12, k = 3, msas = "recursive", cf = "weighted", transform = "none")
+mine2 <- wnn_forecast(USAccDeaths, lags = 1:12, h = 4, k = 3, msas = "recursive", cb = "weighted")
+check("recursive + weighted", as.numeric(ref2$prediction), mine2)
+
+ref3  <- knn_forecasting(ts_data, h = 6, lags = 1:12, k = 3, msas = "MIMO", cf = "mean", transform = "none")
+mine3 <- wnn_forecast(ts_data, lags = 1:12, h = 6, k = 3, msas = "MIMO", cb = "mean")
+check("MIMO + mean", as.numeric(ref3$prediction), mine3)
+
+ref4  <- knn_forecasting(AirPassengers, h = 12, lags = 1:12, k = 5, msas = "MIMO", cf = "weighted", transform = "none")
+mine4 <- wnn_forecast(AirPassengers, lags = 1:12, h = 12, k = 5, msas = "MIMO", cb = "weighted")
+check("AirPassengers, MIMO + weighted", as.numeric(ref4$prediction), mine4)
+
+ref5  <- knn_forecasting(AirPassengers, h = 8, lags = c(1,2,3,12), k = 4, msas = "recursive", cf = "weighted", transform = "none")
+mine5 <- wnn_forecast(AirPassengers, lags = c(1,2,3,12), h = 8, k = 4, msas = "recursive", cb = "weighted")
+check("lags non contigus, recursive + weighted", as.numeric(ref5$prediction), mine5)
+```
+
+Les écarts sont nuls (0) dans les 5 configurations testées : l'implémentation ci-dessus est fidèle à
+l'algorithme WNN de référence.
+
+## 5. Sélection des hyperparamètres sur `Elec-train`
+
+On utilise le même split de validation que dans `Elec_train.Rmd` : le dernier jour d'entraînement (96
+points, le 18/02) est retiré comme validation, le reste sert à l'entraînement. On teste plusieurs
+tailles de fenêtre de `lags` (1 à 5 jours passés) et plusieurs valeurs de `k`, en stratégie **MIMO**
+(adaptée puisqu'on veut directement les 96 points du 19/02 en une seule fois).
+
+```{r cv_split}
+train2 <- window(power_train_clean, end = time(power_train_clean)[n_train - h])
+valid  <- window(power_train_clean, start = time(power_train_clean)[n_train - h + 1])
+
+rmse <- function(actual, pred) sqrt(mean((actual - pred)^2))
+mae  <- function(actual, pred) mean(abs(actual - pred))
+```
+
+```{r cv_wnn}
+grid <- expand.grid(window = c(96, 192, 288, 384, 480), k = c(5, 10, 15, 20, 30))
+grid$RMSE <- NA
+grid$MAE  <- NA
+
+for (i in 1:nrow(grid)) {
+  fc <- wnn_forecast(train2, lags = 1:grid$window[i], h = h, k = grid$k[i],
+                      msas = "MIMO", cb = "weighted")
+  grid$RMSE[i] <- rmse(as.numeric(valid), fc)
+  grid$MAE[i]  <- mae(as.numeric(valid), fc)
+}
+
+grid[order(grid$RMSE), ]
+```
+
+```{r cv_best}
+best <- grid[which.min(grid$RMSE), ]
+cat("Meilleurs hyperparametres : window =", best$window, "jours de lags (",
+    best$window / 96, "jours), k =", best$k, "\n")
+cat("RMSE:", best$RMSE, " MAE:", best$MAE, "\n")
+```
+
+## 6. Prévision finale pour le 19/02/2010
+
+On réentraîne (implicitement, WNN n'a pas de phase d'entraînement séparée : les instances sont
+recalculées à la volée) sur l'intégralité de `power_train_clean` avec les meilleurs hyperparamètres, et
+on prévoit les 96 points du 19/02.
+
+```{r final_forecast}
+fc_wnn <- wnn_forecast(power_train_clean, lags = 1:best$window, h = h, k = best$k,
+                        msas = "MIMO", cb = "weighted")
+summary(fc_wnn)
+```
+
+```{r final_plot}
+ts_start_date <- elec_train$Timestamp[1]
+forecast_dates <- elec_train$Timestamp[(n_train + 1):(n_train + h)]
+
+df_plot <- data.frame(
+  Timestamp = c(elec_train$Timestamp[1:n_train], forecast_dates),
+  Power     = c(as.numeric(power_train_clean), fc_wnn),
+  Type      = c(rep("Historique", n_train), rep("Prevision WNN", h))
+)
+df_plot_zoom <- df_plot[df_plot$Timestamp >= as.POSIXct("2010-02-10", tz = "UTC"), ]
+
+ggplot(df_plot_zoom, aes(Timestamp, Power, color = Type)) +
+  geom_line() +
+  scale_color_manual(values = c("Historique" = "steelblue", "Prevision WNN" = "darkorange")) +
+  ggtitle("Prevision WNN - Power (kW) - 19/02/2010") +
+  ylab("Power (kW)") + xlab(NULL)
+```
+
+## 7. Comparaison avec la Partie 1
+
+Sur le même split de validation (dernier jour d'entraînement retiré), les résultats obtenus dans
+`Elec_train.Rmd` étaient :
+
+| Méthode | RMSE | MAE |
+|---|---|---|
+| Exponential Smoothing (STL+ETS) | 14.19 | 10.93 |
+| **WNN** | **`r round(best$RMSE, 2)`** | **`r round(best$MAE, 2)`** |
+| SVM (tuné) | 16.22 | 12.31 |
+| XGBoost (tuné) | 16.24 | 12.56 |
+| Random Forest | 17.28 | 13.65 |
+| SARIMA | 22.65 | 18.05 |
+| NNETAR | 26.51 | 21.07 |
+
+WNN se positionne juste derrière le lissage exponentiel (STL+ETS) et devance nettement SVM, XGBoost,
+Random Forest, SARIMA et le réseau de neurones — un résultat cohérent avec la littérature (WNN et ses
+variantes sont couramment utilisées comme référence performante pour la prévision de séries de
+consommation électrique).
