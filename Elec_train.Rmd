@@ -8,11 +8,14 @@ output: html_document
 
 ## 1. Chargement des packages
 
-Le package `readxl` est nécessaire pour lire le fichier Excel.
-Si le package manque, installer avec : `install.packages("readxl")`.
+Le package `readxl` est nécessaire pour lire le fichier Excel, `forecast` et `ggplot2` pour les
+graphiques de séries temporelles (`ggseasonplot`, `autoplot`, ...) utilisés dès la section suivante.
+Si un package manque, installer avec `install.packages("readxl")`, etc.
 
 ```{r packages, message = FALSE}
 library(readxl)
+library(forecast)
+library(ggplot2)
 ```
 
 ## 2. Lecture du fichier Excel
@@ -180,7 +183,168 @@ library(fpp2)
 Arima(power_train)
 ```
 ```{r}
-install.packages("fpp2")`
-auto.arima(power_train)
+library(forecast)
 
+fit_arima <- auto.arima(power_train, seasonal = TRUE, approximation = TRUE)
+summary(fit_arima)
+checkresiduals(fit_arima)
 ```
+
+```{r}
+model <- Arima(power_train, order = c(3,0,0))
+checkresiduals(model)
+```
+
+
+# SARIMA
+```{r}
+ggtsdisplay(
+  diff(power_train, lag = 96),
+  main = "Power (kW) - différenciée saisonnière (lag 96)"
+  )
+```
+
+# Random Forest
+```{r}
+library(randomForest)
+
+# Serie Power complete : entrainement nettoye + NA pour le 19/02 a prevoir
+power_full <- c(as.numeric(power_train), rep(NA, nrow(elec_train) - n_train))
+
+df <- data.frame(
+  Timestamp = elec_train$Timestamp,
+  Power     = power_full,
+  Temp      = elec_train$`Temp (C°)`
+)
+df$hour  <- as.numeric(format(df$Timestamp, "%H")) + as.numeric(format(df$Timestamp, "%M")) / 60
+df$dow   <- factor(weekdays(df$Timestamp),
+                    levels = c("Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"))
+df$lag96 <- c(rep(NA, 96), head(df$Power, -96))   # meme creneau, jour precedent
+
+train_df <- df[97:n_train, ]                # on perd les 96 1eres lignes (pas de lag96 dispo)
+test_df  <- df[(n_train + 1):nrow(df), ]    # le 19/02 a prevoir
+
+set.seed(123)
+rf_model <- randomForest(Power ~ Temp + hour + dow + lag96,
+                          data = train_df, ntree = 500, importance = TRUE)
+print(rf_model)
+importance(rf_model)
+
+pred_rf <- predict(rf_model, newdata = test_df)
+```
+
+# Comparaison des méthodes (exponential smoothing, SARIMA, NN, RF, SVM, XGBoost)
+
+Le sujet demande de tester et comparer toutes les méthodes vues en cours. On compare ici sur un
+split de validation simple : le dernier jour d'entraînement (96 points, le 18/02) est retiré et
+sert de validation, le reste sert à l'entraînement. Chaque méthode prévoit ces 96 points et on
+calcule RMSE/MAE contre les vraies valeurs.
+
+```{r cv_split}
+h <- 96
+train2 <- window(power_train, end = time(power_train)[n_train - h])
+valid  <- window(power_train, start = time(power_train)[n_train - h + 1])
+
+rmse <- function(actual, pred) sqrt(mean((actual - pred)^2))
+mae  <- function(actual, pred) mean(abs(actual - pred))
+```
+
+## Exponential smoothing (STL + ETS)
+
+`ets()` refuse les séries avec `frequency > 24` (elle ignore la saisonnalité). On passe donc par
+`stlf()` : décomposition STL puis ETS sur la partie désaisonnalisée.
+
+```{r cv_ets}
+fc_ets <- stlf(train2, h = h, method = "ets")
+cat("RMSE:", rmse(valid, fc_ets$mean), " MAE:", mae(valid, fc_ets$mean), "\n")
+```
+
+## SARIMA
+
+```{r cv_sarima}
+fit_sarima2 <- auto.arima(train2, seasonal = TRUE, approximation = TRUE)
+fc_sarima   <- forecast(fit_sarima2, h = h)
+cat("RMSE:", rmse(valid, fc_sarima$mean), " MAE:", mae(valid, fc_sarima$mean), "\n")
+```
+
+## Neural Net (nnetar)
+
+```{r cv_nnetar}
+set.seed(123)
+fit_nn <- nnetar(train2)
+fc_nn  <- forecast(fit_nn, h = h)
+cat("RMSE:", rmse(valid, fc_nn$mean), " MAE:", mae(valid, fc_nn$mean), "\n")
+```
+
+## Split identique pour les modèles à base de features (RF / SVM / XGBoost)
+
+```{r cv_features}
+df$dow_n  <- as.numeric(df$dow)
+train_df2 <- df[97:(n_train - h), ]
+valid_df  <- df[(n_train - h + 1):n_train, ]
+```
+
+## Random Forest
+
+```{r cv_rf}
+set.seed(123)
+rf2      <- randomForest(Power ~ Temp + hour + dow + lag96, data = train_df2, ntree = 500)
+pred_rf2 <- predict(rf2, newdata = valid_df)
+cat("RMSE:", rmse(valid_df$Power, pred_rf2), " MAE:", mae(valid_df$Power, pred_rf2), "\n")
+```
+
+## SVM (tuné par cross-validation interne à e1071)
+
+```{r cv_svm}
+library(e1071)
+set.seed(123)
+tuned_svm      <- tune.svm(Power ~ Temp + hour + dow + lag96, data = train_df2,
+                            cost = c(1, 10, 100), gamma = c(0.01, 0.1, 1))
+pred_svm_tuned <- predict(tuned_svm$best.model, newdata = valid_df)
+cat("RMSE:", rmse(valid_df$Power, pred_svm_tuned), " MAE:", mae(valid_df$Power, pred_svm_tuned), "\n")
+```
+
+## XGBoost (tuné par cross-validation 5-fold)
+
+```{r cv_xgboost}
+library(xgboost)
+feat_cols <- c("Temp", "hour", "dow_n", "lag96")
+dtrain <- xgb.DMatrix(data = as.matrix(train_df2[, feat_cols]), label = train_df2$Power)
+dvalid <- xgb.DMatrix(data = as.matrix(valid_df[, feat_cols]), label = valid_df$Power)
+
+grid <- expand.grid(max_depth = c(3, 6, 9), eta = c(0.05, 0.1, 0.3),
+                     best_rmse = NA, best_nrounds = NA)
+set.seed(123)
+for (i in 1:nrow(grid)) {
+  params <- list(objective = "reg:squarederror", max_depth = grid$max_depth[i], eta = grid$eta[i])
+  cv <- xgb.cv(params = params, data = dtrain, nrounds = 300, nfold = 5,
+               early_stopping_rounds = 20, verbose = 0)
+  grid$best_rmse[i]    <- min(cv$evaluation_log$test_rmse_mean)
+  grid$best_nrounds[i] <- cv$best_iteration
+}
+best <- grid[which.min(grid$best_rmse), ]
+cat("Meilleurs hyperparametres : max_depth =", best$max_depth, " eta =", best$eta,
+    " nrounds =", best$best_nrounds, "\n")
+
+final_xgb <- xgb.train(params = list(objective = "reg:squarederror",
+                                      max_depth = best$max_depth, eta = best$eta),
+                        data = dtrain, nrounds = best$best_nrounds)
+pred_xgb <- predict(final_xgb, dvalid)
+cat("RMSE:", rmse(valid_df$Power, pred_xgb), " MAE:", mae(valid_df$Power, pred_xgb), "\n")
+```
+
+## Tableau comparatif
+
+```{r cv_summary}
+resultats <- data.frame(
+  Methode = c("ExpSmoothing (STL+ETS)", "SARIMA", "NNETAR", "RandomForest", "SVM (tune)", "XGBoost (tune)"),
+  RMSE = c(rmse(valid, fc_ets$mean), rmse(valid, fc_sarima$mean), rmse(valid, fc_nn$mean),
+           rmse(valid_df$Power, pred_rf2), rmse(valid_df$Power, pred_svm_tuned), rmse(valid_df$Power, pred_xgb)),
+  MAE  = c(mae(valid, fc_ets$mean), mae(valid, fc_sarima$mean), mae(valid, fc_nn$mean),
+           mae(valid_df$Power, pred_rf2), mae(valid_df$Power, pred_svm_tuned), mae(valid_df$Power, pred_xgb))
+)
+resultats[order(resultats$RMSE), ]
+```
+
+**LSTM** : pas encore testé — nécessite les packages `keras` + TensorFlow (backend Python), non
+installés dans cet environnement (installation lourde). À ajouter dans une itération suivante.
