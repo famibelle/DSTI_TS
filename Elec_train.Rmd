@@ -131,7 +131,7 @@ pacf_power <- pacf(
 
 
 
-Box-Pierce test tests if the time series is auto-correlated or not.
+Le test de Box-Pierce vérifie si la série temporelle est autocorrélée ou non.
 ```{r Boxtest}
 Box.test(power_train,lag=2*96,type="Box-Pierce")
 ```
@@ -139,13 +139,13 @@ Box.test(power_train,lag=2*96,type="Box-Pierce")
 p-value ≈ 0, on rejette H0 (l'hypothèse de bruit blanc). power_train est très fortement autocorrélée
 
 
-# exponential smoothing
+# Lissage exponentiel
 ```{r SES}
 SES=ses(power_train,h=96)
 SES
 autoplot(SES)
 ```
-Moving average
+Moyenne mobile (décomposition)
 
 ```{r}
 autoplot(decompose(power_train,type="additive"))
@@ -233,7 +233,7 @@ importance(rf_model)
 pred_rf <- predict(rf_model, newdata = test_df)
 ```
 
-# Comparaison des méthodes (exponential smoothing, SARIMA, NN, RF, SVM, XGBoost)
+# Comparaison des méthodes (lissage exponentiel, SARIMA, réseau de neurones, RF, SVM, XGBoost)
 
 Le sujet demande de tester et comparer toutes les méthodes vues en cours. On compare ici sur un
 split de validation simple : le dernier jour d'entraînement (96 points, le 18/02) est retiré et
@@ -249,7 +249,7 @@ rmse <- function(actual, pred) sqrt(mean((actual - pred)^2))
 mae  <- function(actual, pred) mean(abs(actual - pred))
 ```
 
-## Exponential smoothing (STL + ETS)
+## Lissage exponentiel (STL + ETS)
 
 `ets()` refuse les séries avec `frequency > 24` (elle ignore la saisonnalité). On passe donc par
 `stlf()` : décomposition STL puis ETS sur la partie désaisonnalisée.
@@ -267,7 +267,7 @@ fc_sarima   <- forecast(fit_sarima2, h = h)
 cat("RMSE:", rmse(valid, fc_sarima$mean), " MAE:", mae(valid, fc_sarima$mean), "\n")
 ```
 
-## Neural Net (nnetar)
+## Réseau de neurones (nnetar)
 
 ```{r cv_nnetar}
 set.seed(123)
@@ -337,7 +337,7 @@ cat("RMSE:", rmse(valid_df$Power, pred_xgb), " MAE:", mae(valid_df$Power, pred_x
 
 ```{r cv_summary}
 resultats <- data.frame(
-  Methode = c("ExpSmoothing (STL+ETS)", "SARIMA", "NNETAR", "RandomForest", "SVM (tune)", "XGBoost (tune)"),
+  Methode = c("LissageExpo (STL+ETS)", "SARIMA", "NNETAR", "RandomForest", "SVM (tuné)", "XGBoost (tuné)"),
   RMSE = c(rmse(valid, fc_ets$mean), rmse(valid, fc_sarima$mean), rmse(valid, fc_nn$mean),
            rmse(valid_df$Power, pred_rf2), rmse(valid_df$Power, pred_svm_tuned), rmse(valid_df$Power, pred_xgb)),
   MAE  = c(mae(valid, fc_ets$mean), mae(valid, fc_sarima$mean), mae(valid, fc_nn$mean),
